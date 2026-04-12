@@ -1,0 +1,111 @@
+# =========================
+# 🔐 Secrets & Environment
+# =========================
+.env
+.env.*
+*.env
+*.secret
+*.key
+
+# =========================
+# 🐍 Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# =========================
+# 🧪 Virtual Environments
+# =========================
+venv/
+env/
+ENV/
+.venv/
+
+# =========================
+# 🧠 ML / RAG / Vector DB
+# =========================
+*.faiss
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+chroma/
+chroma_db/
+vectorstore/
+faiss_index/
+index/
+
+# =========================
+# 📊 Logs & Runtime Files
+# =========================
+*.log
+logs/
+*.out
+*.err
+
+# =========================
+# 💻 IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# =========================
+# 🧾 OS Files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# 🌐 Streamlit / App Cache
+# =========================
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# =========================
+# 📦 Node (if frontend used)
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# 🧪 Testing / Coverage
+# =========================
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# =========================
+# 🗄️ Database
+# =========================
+*.sqlite3
+*.db
+
+# =========================
+# 🚀 Deployment
+# =========================
+.env.production
+.env.local
