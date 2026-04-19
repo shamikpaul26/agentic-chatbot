@@ -1,5 +1,5 @@
 """
-chat_model_v4.py  —  PERMANENT FIX
+chat_model_v5.py  —  PERMANENT FIX + SHORT-TERM MEMORY SUBGRAPH
 
 ROOT CAUSE OF THE ORIGINAL ERROR
 --------------------------------
@@ -40,14 +40,38 @@ ones via `asyncio.to_thread`. Best of both worlds:
 We open the sqlite connection with `check_same_thread=False` so the same
 connection is usable from the main Streamlit thread, the background
 loop thread, and the `to_thread` worker threads.
+
+SHORT-TERM MEMORY SUBGRAPH
+---------------------------
+A dedicated `memory_subgraph` sits between message ingestion and the
+chat node. It runs ONLY when total token count > TOKEN_LIMIT (5000).
+
+Algorithm:
+  1. Count tokens for all messages (system excluded).
+  2. If count <= TOKEN_LIMIT → pass through unchanged.
+  3. If count > TOKEN_LIMIT:
+       a. Pop the oldest messages (oldest-first) until we are back
+          under TOKEN_LIMIT.
+       b. Ask the LLM to summarize the popped messages into one
+          compact paragraph.
+       c. Merge the new summary with any pre-existing summary.
+       d. Store the merged summary in state["summary"].
+       e. Return the trimmed messages list.
+  4. chat_node reads state["summary"] and prepends it as a
+     SystemMessage BEFORE the main SYSTEM_PROMPT so the LLM always
+     has the context of what was discussed earlier.
+
+No existing logic is modified — the subgraph is inserted as a new node
+between "encrypt_input" and "chat_node".
 """
 
 import threading
 import json
 import asyncio
 import sqlite3
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Optional, Sequence
 from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import RemoveMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import (
@@ -88,11 +112,44 @@ MCP_CONFIG = {
 }
 
 # ===============================
+# MEMORY CONFIG
+# ===============================
+
+# Token budget for the conversation history (system prompt excluded).
+# When total tokens exceed this, oldest messages are pruned and
+# summarised into state["summary"].
+TOKEN_LIMIT = 5000
+
+
+def _count_tokens(text: str) -> int:
+    """
+    Lightweight token estimator (~4 chars ≈ 1 token for English text).
+    Avoids a network round-trip to tiktoken's BPE file while staying
+    accurate enough for the 5 000-token trim decision.
+    Each message also carries ~4 tokens of structural overhead
+    (role, separators) — callers add that separately.
+    """
+    return max(1, len(text) // 4)
+
+
+def _messages_token_count(messages: list[BaseMessage]) -> int:
+    """Return total estimated tokens for a list of messages."""
+    total = 0
+    for msg in messages:
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        total += _count_tokens(content) + 4   # 4-token per-message overhead
+    return total
+
+
+# ===============================
 # STATE
 # ===============================
 
 class ChatbotState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    # Accumulated summary of pruned messages.  None until first prune.
+    summary: Optional[str]
+
 
 # ===============================
 # SYSTEM PROMPT
@@ -159,6 +216,156 @@ def decrypt_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
             out.append(msg)
     return out
 
+
+# ===============================
+# MEMORY SUBGRAPH
+# ===============================
+# The subgraph operates on the same ChatbotState so it can be compiled
+# as an inner graph and called as a node in the main graph.
+#
+# Nodes:
+#   check_tokens  → decides whether trimming is needed
+#   summarize     → called only when tokens > TOKEN_LIMIT
+#
+# Edges:
+#   START → check_tokens
+#   check_tokens --[need_summary]--> summarize → END
+#   check_tokens --[ok]-----------> END
+
+def _build_memory_subgraph(summarizer_llm: ChatOpenAI) -> Any:
+    """
+    Build and compile a LangGraph subgraph that trims messages exceeding
+    TOKEN_LIMIT and generates / merges a running summary.
+
+    Parameters
+    ----------
+    summarizer_llm : ChatOpenAI
+        The LLM instance to use for summarisation (same as main llm).
+
+    Returns
+    -------
+    Compiled subgraph (Runnable) that can be used as a node.
+    """
+
+    async def check_tokens_node(state: ChatbotState) -> dict:
+        """
+        Count tokens.  If within budget, return unchanged.
+        If over budget, trim oldest messages using RemoveMessage (the
+        correct LangGraph deletion pattern) and stash pruned messages
+        in the module-level scratch dict so summarize_node can read them
+        within the same subgraph invocation.
+        """
+        messages = state["messages"]
+        total_tokens = _messages_token_count(messages)
+
+        if total_tokens <= TOKEN_LIMIT:
+            # Nothing to do — pass through unchanged
+            return {}
+
+        # ---- trim oldest messages until we are back under budget ----
+        to_summarise: list[BaseMessage] = []
+        remaining: list[BaseMessage] = list(messages)
+
+        while remaining and _messages_token_count(remaining) > TOKEN_LIMIT:
+            to_summarise.append(remaining.pop(0))
+
+        # Guard: never pop the very last message (the new user turn)
+        if not remaining:
+            remaining = [to_summarise.pop()]
+
+        # Stash pruned messages so summarize_node can read them
+        _memory_subgraph_scratch["to_summarise"]  = to_summarise
+        _memory_subgraph_scratch["needs_summary"] = True
+
+        # RemoveMessage is the correct LangGraph API to delete state entries.
+        # Each RemoveMessage(id=x) instructs add_messages to drop that id.
+        removals = [RemoveMessage(id=m.id) for m in to_summarise if m.id]
+        return {"messages": removals}
+
+    async def summarize_node(state: ChatbotState) -> dict:
+        """
+        Summarise the pruned messages, merge with any prior summary,
+        and persist back into state["summary"].
+        Only called when _memory_subgraph_scratch["needs_summary"] is True.
+        """
+        to_summarise: list[BaseMessage] = _memory_subgraph_scratch.pop(
+            "to_summarise", []
+        )
+        _memory_subgraph_scratch.pop("needs_summary", None)
+        _memory_subgraph_scratch.pop("trimmed_messages", None)
+
+        if not to_summarise:
+            return {}
+
+        # Decrypt before summarising (messages are stored encrypted)
+        decrypted = decrypt_messages(to_summarise)
+
+        # Build a concise transcript for the summariser
+        transcript_parts = []
+        for msg in decrypted:
+            role = (
+                "User" if isinstance(msg, HumanMessage)
+                else "Assistant" if isinstance(msg, AIMessage)
+                else "Tool"
+            )
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if content.strip():
+                transcript_parts.append(f"{role}: {content.strip()}")
+
+        transcript = "\n".join(transcript_parts)
+
+        prior_summary: Optional[str] = state.get("summary")
+
+        if prior_summary:
+            prompt = (
+                f"You are maintaining a running summary of a conversation.\n\n"
+                f"EXISTING SUMMARY:\n{prior_summary}\n\n"
+                f"NEW CONVERSATION SEGMENT TO INCORPORATE:\n{transcript}\n\n"
+                f"Write a single concise paragraph (≤120 words) that merges "
+                f"the existing summary with the new segment. Capture all "
+                f"important context, decisions, and facts. Be terse."
+            )
+        else:
+            prompt = (
+                f"Summarise the following conversation segment into a single "
+                f"concise paragraph (≤120 words). Capture the key topics, "
+                f"decisions, and facts discussed. Be terse.\n\n"
+                f"CONVERSATION:\n{transcript}"
+            )
+
+        response = await summarizer_llm.ainvoke([HumanMessage(content=prompt)])
+        new_summary = response.content.strip()
+
+        print(f"[MemorySubgraph] Summary updated ({len(to_summarise)} msgs pruned). "
+              f"Summary: {new_summary[:80]}…")
+
+        return {"summary": new_summary}
+
+    def _needs_summary(state: ChatbotState) -> str:
+        """Routing function: did check_tokens_node flag a summary is needed?"""
+        return "summarize" if _memory_subgraph_scratch.get("needs_summary") else END
+
+    # Build subgraph
+    subgraph = StateGraph(ChatbotState)
+    subgraph.add_node("check_tokens", check_tokens_node)
+    subgraph.add_node("summarize",    summarize_node)
+
+    subgraph.add_edge(START, "check_tokens")
+    subgraph.add_conditional_edges(
+        "check_tokens",
+        _needs_summary,
+        {"summarize": "summarize", END: END},
+    )
+    subgraph.add_edge("summarize", END)
+
+    return subgraph.compile()
+
+
+# Module-level scratch space for inter-node communication within the
+# memory subgraph (same Python process, single-threaded event loop).
+_memory_subgraph_scratch: dict = {}
+
+
 # ===============================
 # GRAPH BUILDER
 # ===============================
@@ -175,11 +382,29 @@ def _build_graph(checkpointer, llm_with_tools, tools):
             ]}
         return {"messages": messages}
 
+    # Build the memory subgraph once (uses same llm for summarisation)
+    memory_subgraph = _build_memory_subgraph(llm)
+
     @traceable(name="chat_node")
     async def chat_node(state: ChatbotState):
         messages = decrypt_messages(sanitize_messages(state["messages"]))
+
+        # ---- Prepend summary as context (if present) ----
+        # Inserted BEFORE the main SYSTEM_PROMPT so the LLM reads:
+        #   [summary context] → [main system prompt] → [conversation]
+        preamble: list[BaseMessage] = []
+        summary: Optional[str] = state.get("summary")
+        if summary:
+            preamble.append(SystemMessage(
+                content=f"[CONVERSATION HISTORY SUMMARY]\n{summary}"
+            ))
+
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SYSTEM_PROMPT] + messages
+            messages = preamble + [SYSTEM_PROMPT] + messages
+        else:
+            # System prompt already present (edge case) — insert summary before it
+            messages = preamble + messages
+
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [AIMessage(
             content=encrypt_content(response.content) if response.content else "",
@@ -203,11 +428,14 @@ def _build_graph(checkpointer, llm_with_tools, tools):
 
     graph = StateGraph(ChatbotState)
     graph.add_node("encrypt_input",       encrypt_input_node)
+    graph.add_node("memory",              memory_subgraph)      # ← NEW SUBGRAPH NODE
     graph.add_node("chat_node",           chat_node)
     graph.add_node("tools",               ToolNode(tools))
     graph.add_node("encrypt_tool_result", encrypt_tool_result_node)
+
     graph.add_edge(START,                 "encrypt_input")
-    graph.add_edge("encrypt_input",       "chat_node")
+    graph.add_edge("encrypt_input",       "memory")             # ← route through memory
+    graph.add_edge("memory",              "chat_node")          # ← then to chat
     graph.add_conditional_edges("chat_node", tools_condition,
                                 {"tools": "tools", END: END})
     graph.add_edge("tools",               "encrypt_tool_result")
